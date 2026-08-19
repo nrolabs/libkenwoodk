@@ -204,6 +204,137 @@ class KenwoodClient(
     // ---- rig control ---------------------------------------------------------
 
     /**
+     * Send a set, then confirm it by reading the value back: sets have no
+     * acknowledge in this dialect, so the read-back is the only proof.
+     * True when the parsed answer equals [expect].
+     */
+    private fun <T> setAndConfirm(
+        set: String,
+        read: String,
+        prefix: String,
+        parse: (String) -> T?,
+        expect: T,
+    ): Boolean {
+        send(set)
+        val seg = transact(read, prefix) ?: return false
+        return parse(seg) == expect
+    }
+
+    /**
+     * One of the rig's own receive controls (CATCTL_* ids). False for an id
+     * this dialect has no wire for — the caller treats that as "the rig
+     * does not have it", never as an error.
+     */
+    fun setControl(id: Int, value: Int): Boolean = when (id) {
+        // CATCTL_FIL: FL0 receive filter, app 1/2/3 maps to rig A/B/C (0-2).
+        1 -> {
+            if (value !in 1..3) {
+                false
+            } else {
+                val sel = value - 1
+                setAndConfirm(P.setFl0(sel)!!, P.getFl0(), "FL0", P::parseFl0, sel)
+            }
+        }
+        // CATCTL_RF_GAIN / CATCTL_SQUELCH / CATCTL_AF_GAIN: plain 000-255
+        // levels (RG / SQ / AG).
+        2, 3, 13 -> {
+            if (value !in 0..255) {
+                false
+            } else {
+                val (set, read, prefix) = when (id) {
+                    2 -> Triple(P.setRg(value), P.getRg(), "RG")
+                    3 -> Triple(P.setSq(value), P.getSq(), "SQ")
+                    else -> Triple(P.setAg(value), P.getAg(), "AG")
+                }
+                setAndConfirm(set, read, prefix, { P.parseLevel(it, prefix) }, value)
+            }
+        }
+        // CATCTL_NR: 0 = off (NR0); 1..15 = NR1, whose effect level is the
+        // separate RL1 command, 01-10 — the 1..15 scale maps onto it by
+        // rounding up so 1 stays audible and 15 is maximum. NR2
+        // (SSB-tuned) is not reachable from this one-dimensional id.
+        4 -> {
+            when {
+                value !in 0..15 -> false
+                value == 0 ->
+                    setAndConfirm(P.setNr(0)!!, P.getNr(), "NR", P::parseNr, 0)
+                !setAndConfirm(P.setNr(1)!!, P.getNr(), "NR", P::parseNr, 1) -> false
+                else -> {
+                    val level = (value * 10 + 14) / 15
+                    setAndConfirm(P.setRl1(level)!!, P.getRl1(), "RL1", P::parseRl1, level)
+                }
+            }
+        }
+        // CATCTL_NB: 0/1 drives NB1 (the pulse blanker). NB2 and its
+        // type/level family stay untouched behind this boolean.
+        5 -> {
+            if (value !in 0..1) {
+                false
+            } else {
+                val on = value == 1
+                setAndConfirm(P.setNb1(on), P.getNb1(), "NB1", P::parseNb1, on)
+            }
+        }
+        // CATCTL_NOTCH_AUTO: the rig's automatic notch is the beat
+        // canceller — 0/1 drives BC0/BC1 (BC2 is not commanded from this
+        // boolean). NT is the tracking notch filter, a different control.
+        6 -> {
+            if (value !in 0..1) {
+                false
+            } else {
+                setAndConfirm(P.setBc(value)!!, P.getBc(), "BC", P::parseBc, value)
+            }
+        }
+        // CATCTL_AGC: app 1 fast / 2 mid / 3 slow, 0 off — the rig numbers
+        // the same states the other way (GC 0 OFF, 1 SLOW, 2 MID, 3 FAST),
+        // so the digit is 4 - value except for off.
+        7 -> {
+            if (value !in 0..3) {
+                false
+            } else {
+                val code = if (value == 0) 0 else 4 - value
+                setAndConfirm(P.setGc(code)!!, P.getGc(), "GC", P::parseGc, code)
+            }
+        }
+        // CATCTL_PREAMP: 0 off, 1/2 = PRE 1/PRE 2, digit-identical.
+        8 -> {
+            if (value !in 0..2) {
+                false
+            } else {
+                setAndConfirm(P.setPa(value)!!, P.getPa(), "PA", P::parsePa, value)
+            }
+        }
+        // CATCTL_ATT: dB onto the nearest RA step (0/6/12/18 dB).
+        9 -> {
+            if (value !in 0..60) {
+                false
+            } else {
+                val code = P.raCodeForDb(value)
+                setAndConfirm(P.setRa(code)!!, P.getRa(), "RA", P::parseRa, code)
+            }
+        }
+        // CATCTL_FILTER_WIDTH: only in the modes where the SL parameter IS
+        // the passband width (CW/FSK/PSK and reverses), snapping Hz to
+        // that mode's documented ladder. In SSB the same command means
+        // low-cut or width depending on a rig menu CAT cannot read, and
+        // AM/FM have only cut frequencies — those modes return false
+        // rather than gamble on the semantics.
+        12 -> {
+            val mode = modeCode.get()
+            val code = if (mode < 0) null else P.slWidthCode(mode, value)?.first
+            if (code == null) {
+                false
+            } else {
+                setAndConfirm(P.setSl0(code)!!, P.getSl0(), "SL0", P::parseSl0, code)
+            }
+        }
+        // CATCTL_PBT_IN / CATCTL_PBT_OUT: the rig's IS command is a single
+        // mode-dependent IF shift, not a twin passband-tune pair;
+        // pretending otherwise would move the wrong knob.
+        else -> false
+    }
+
+    /**
      * Set the operating mode from the app's CAT mode-code space.
      *
      * `CMD_CAT_SET_MODE` carries the CI-V code numbering the host already

@@ -259,6 +259,180 @@ object KenwoodProtocol {
         return if (v <= 255) v.toInt() else null
     }
 
+    // ---- receive controls ----------------------------------------------------
+
+    /**
+     * AGC time constant, `GC` P1: 0 OFF, 1 SLOW, 2 MID, 3 FAST. Code 4
+     * (OFF-to-ON) is set-only and never appears in an answer; it is not
+     * built here because the driver always sets an explicit state.
+     */
+    fun setGc(code: Int): String? = if (code in 0..3) "GC$code;" else null
+
+    fun getGc(): String = "GC;"
+
+    fun parseGc(seg: String): Int? {
+        val v = seg.afterPrefix("GC")?.let { parseDigits(it, 1) }?.toInt() ?: return null
+        return if (v <= 3) v else null
+    }
+
+    /** Noise reduction, `NR` P1: 0 OFF, 1 NR1, 2 NR2 (NR2 invalid in FM). */
+    fun setNr(code: Int): String? = if (code in 0..2) "NR$code;" else null
+
+    fun getNr(): String = "NR;"
+
+    fun parseNr(seg: String): Int? {
+        val v = seg.afterPrefix("NR")?.let { parseDigits(it, 1) }?.toInt() ?: return null
+        return if (v <= 2) v else null
+    }
+
+    /**
+     * NR1 effect level, `RL1` P1 = 01-10 (2 digits). 99 (initial value) is
+     * set-only and not built here.
+     */
+    fun setRl1(level: Int): String? = if (level in 1..10) "RL1%02d;".format(level) else null
+
+    fun getRl1(): String = "RL1;"
+
+    fun parseRl1(seg: String): Int? {
+        val v = seg.afterPrefix("RL1")?.let { parseDigits(it, 2) }?.toInt() ?: return null
+        return if (v in 1..10) v else null
+    }
+
+    /** Noise blanker 1, `NB1` P1: 0 OFF, 1 ON. */
+    fun setNb1(on: Boolean): String = "NB1${if (on) 1 else 0};"
+
+    fun getNb1(): String = "NB1;"
+
+    fun parseNb1(seg: String): Boolean? =
+        seg.afterPrefix("NB1")?.let { parseDigits(it, 1) }?.let { it == 1L }
+
+    /** Beat cancel (the rig's automatic notch), `BC` P1: 0 OFF, 1 BC1, 2 BC2. */
+    fun setBc(code: Int): String? = if (code in 0..2) "BC$code;" else null
+
+    fun getBc(): String = "BC;"
+
+    fun parseBc(seg: String): Int? {
+        val v = seg.afterPrefix("BC")?.let { parseDigits(it, 1) }?.toInt() ?: return null
+        return if (v <= 2) v else null
+    }
+
+    /** Pre-amplifier, `PA` P1: 0 OFF, 1 PRE 1, 2 PRE 2. */
+    fun setPa(code: Int): String? = if (code in 0..2) "PA$code;" else null
+
+    fun getPa(): String = "PA;"
+
+    fun parsePa(seg: String): Int? {
+        val v = seg.afterPrefix("PA")?.let { parseDigits(it, 1) }?.toInt() ?: return null
+        return if (v <= 2) v else null
+    }
+
+    /**
+     * The attenuation each `RA` code selects, indexed by code: 0 OFF, then
+     * 6/12/18 dB.
+     */
+    val RA_STEPS_DB = intArrayOf(0, 6, 12, 18)
+
+    /** Attenuator, `RA` P1 = the step code. */
+    fun setRa(code: Int): String? = if (code in RA_STEPS_DB.indices) "RA$code;" else null
+
+    fun getRa(): String = "RA;"
+
+    fun parseRa(seg: String): Int? {
+        val v = seg.afterPrefix("RA")?.let { parseDigits(it, 1) }?.toInt() ?: return null
+        return if (v in RA_STEPS_DB.indices) v else null
+    }
+
+    /** The `RA` code whose step is nearest to [db] (ties round down). */
+    fun raCodeForDb(db: Int): Int {
+        var best = 0
+        for (i in RA_STEPS_DB.indices) {
+            if (kotlin.math.abs(RA_STEPS_DB[i] - db) <
+                kotlin.math.abs(RA_STEPS_DB[best] - db)
+            ) {
+                best = i
+            }
+        }
+        return best
+    }
+
+    /**
+     * Receive filter selection, `FL0` P1: 0 = A, 1 = B, 2 = C (C only when
+     * the rig's RX-filter-numbers menu allows three).
+     */
+    fun setFl0(sel: Int): String? = if (sel in 0..2) "FL0$sel;" else null
+
+    fun getFl0(): String = "FL0;"
+
+    /**
+     * Parse an `FL0` answer into the selection digit. The answer carries a
+     * trailing 270 Hz-option digit; a bare selection digit is also accepted.
+     */
+    fun parseFl0(seg: String): Int? {
+        val rest = seg.afterPrefix("FL0") ?: return null
+        if (rest.length !in 1..2) return null
+        val sel = parseDigits(rest.substring(0, 1), 1)?.toInt() ?: return null
+        if (rest.length == 2) {
+            val opt = parseDigits(rest.substring(1), 1) ?: return null
+            if (opt > 1) return null
+        }
+        return if (sel <= 2) sel else null
+    }
+
+    /**
+     * `SL` passband-width tables (setting type 0), Hz by 2-digit ID, per
+     * the modes where the SL parameter IS the width. In SSB/AM/FM the same
+     * command carries a low-cut frequency (or, in SSB with the rig menu in
+     * width/shift mode, a width) — an ambiguity CAT cannot read, so those
+     * modes are not driven through this table.
+     */
+    val SL_WIDTHS_CW_HZ = intArrayOf(
+        50, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000,
+        1500, 2000, 2500,
+    )
+    val SL_WIDTHS_FSK_HZ = intArrayOf(250, 300, 350, 400, 450, 500, 1000, 1500)
+    val SL_WIDTHS_PSK_HZ = intArrayOf(
+        50, 80, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000,
+        1200, 1400, 1500, 1600, 1800, 2000, 2200, 2400, 2600, 2800, 3000,
+    )
+
+    /**
+     * The width ladder `SL` uses in OM mode [mode], or null when the SL
+     * parameter is not a passband width in that mode.
+     */
+    fun slWidthTable(mode: Int): IntArray? = when (mode) {
+        MODE_CW, MODE_CW_R -> SL_WIDTHS_CW_HZ
+        MODE_FSK, MODE_FSK_R -> SL_WIDTHS_FSK_HZ
+        MODE_PSK, MODE_PSK_R -> SL_WIDTHS_PSK_HZ
+        else -> null
+    }
+
+    /**
+     * The `SL` ID whose width is nearest [hz] in [mode] (ties round down),
+     * with the width it selects. Null when the mode has no width ladder or
+     * [hz] is not positive.
+     */
+    fun slWidthCode(mode: Int, hz: Int): Pair<Int, Int>? {
+        if (hz <= 0) return null
+        val table = slWidthTable(mode) ?: return null
+        var best = 0
+        for (i in table.indices) {
+            if (kotlin.math.abs(table[i] - hz) < kotlin.math.abs(table[best] - hz)) {
+                best = i
+            }
+        }
+        return Pair(best, table[best])
+    }
+
+    /** Receive filter low-cut/width, setting value (type 0), 2-digit ID. */
+    fun setSl0(id: Int): String? = if (id in 0..35) "SL0%02d;".format(id) else null
+
+    fun getSl0(): String = "SL0;"
+
+    fun parseSl0(seg: String): Int? {
+        val v = seg.afterPrefix("SL0")?.let { parseDigits(it, 2) }?.toInt() ?: return null
+        return if (v <= 35) v else null
+    }
+
     /** Power-status query, doubling as the LAN keepalive. */
     fun getPs(): String = "PS;"
 
