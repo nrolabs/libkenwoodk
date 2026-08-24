@@ -19,6 +19,7 @@
 package com.isaklab.libkenwoodk
 
 import com.isaklab.isdrdrivers.core.RadioClient
+import com.isaklab.isdrdrivers.core.CatControlCapable
 import com.isaklab.isdrdrivers.core.TransmitCapable
 import com.isaklab.libcivk.CivTransport
 import com.isaklab.libkenwoodk.KenwoodProtocol as P
@@ -53,7 +54,7 @@ class KenwoodClient(
     /** (power spectrum in dB, interleaved IQ — always empty for this dialect) */
     private val onDataReceived: (FloatArray, FloatArray) -> Unit,
     private val onConnectionStatusChanged: (Boolean, String) -> Unit,
-) : RadioClient, TransmitCapable {
+) : RadioClient, TransmitCapable, CatControlCapable {
 
     /**
      * Which physical link the transport carries; the KNS handshake, the `##`
@@ -361,6 +362,49 @@ class KenwoodClient(
         val (_, m) = P.parseOm(seg) ?: return false
         modeCode.set(m)
         return m == om
+    }
+
+    override fun setCatMode(mode: Int): Boolean = setMode(mode)
+
+    override fun currentCatMode(): Int = when (modeCode.get()) {
+        P.MODE_LSB -> 0
+        P.MODE_USB -> 1
+        P.MODE_AM -> 2
+        P.MODE_CW -> 3
+        P.MODE_FSK -> 4
+        P.MODE_FM -> 5
+        P.MODE_CW_R -> 7
+        P.MODE_FSK_R -> 8
+        else -> -1
+    }
+
+    override fun setCatControl(id: Int, value: Int): Boolean = setControl(id, value)
+
+    /**
+     * Put transmit on VFO B at [hz] while receive remains on VFO A.
+     *
+     * TS-890S/TS-990S represent split with their ordinary VFOs and the FR/FT
+     * selectors; there is no separate TX-frequency register. Every write is
+     * therefore read back, and FA is sampled before and after as the receive
+     * invariant. A panel-side tune racing this transaction is reported as a
+     * refusal while the cache is reconciled to the rig's final FA value.
+     */
+    fun configureSplitTxFrequency(hz: Long): Boolean {
+        if (model == null) return false
+        val setFb = P.setFb(hz) ?: return false
+
+        val rxBefore = transact(P.getFa(), "FA")?.let(P::parseFa) ?: return false
+        freqHz.set(rxBefore)
+        refreshEdges()
+
+        if (!setAndConfirm(setFb, P.getFb(), "FB", P::parseFb, hz)) return false
+        if (!setAndConfirm(P.setFr(0)!!, P.getFr(), "FR", P::parseFr, 0)) return false
+        if (!setAndConfirm(P.setFt(1)!!, P.getFt(), "FT", P::parseFt, 1)) return false
+
+        val rxAfter = transact(P.getFa(), "FA")?.let(P::parseFa) ?: return false
+        freqHz.set(rxAfter)
+        refreshEdges()
+        return rxAfter == rxBefore
     }
 
     private fun fail(msg: String): Boolean {
@@ -721,10 +765,7 @@ class KenwoodClient(
 
     // ---- TransmitCapable -----------------------------------------------------
 
-    override fun setTxFrequency(hz: Long) {
-        // The rig transmits where it is tuned; there is no separate TX NCO.
-        setFrequency(hz)
-    }
+    override fun setTxFrequency(hz: Long): Boolean = configureSplitTxFrequency(hz)
 
     override fun setPtt(on: Boolean) {
         // Keying has no acknowledge and no dedicated query; the optimistic
